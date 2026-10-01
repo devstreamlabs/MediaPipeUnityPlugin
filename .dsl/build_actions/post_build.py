@@ -39,6 +39,66 @@ def sha256_of(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def macho_segments(path: pathlib.Path) -> dict:
+    """{(cpu type, segment, section): sha256 of the section's bytes} for every
+    64-bit Mach-O slice; __LINKEDIT (signature, symbol tables) excluded.
+
+    A macOS player build re-signs every plugin it copies into Contents/PlugIns
+    (ad hoc), which rewrites the code signature in __LINKEDIT and the load
+    command pointing at it (in the header at the start of __TEXT), so the
+    shipped dylib is never byte-identical to the release's. Every section --
+    the code and data -- must be."""
+    import struct
+    data = path.read_bytes()
+    slices = []
+    magic = struct.unpack_from(">I", data, 0)[0]
+    if magic in (0xCAFEBABE, 0xCAFEBABF):  # fat (universal), big-endian header
+        count = struct.unpack_from(">I", data, 4)[0]
+        wide = magic == 0xCAFEBABF
+        for i in range(count):
+            if wide:
+                _cpu, _sub, off, size = struct.unpack_from(">iiQQ", data, 8 + i * 32)[:4]
+            else:
+                _cpu, _sub, off, size = struct.unpack_from(">iiII", data, 8 + i * 20)[:4]
+            slices.append(data[off:off + size])
+    else:
+        slices.append(data)
+    out = {}
+    for blob in slices:
+        if struct.unpack_from("<I", blob, 0)[0] != 0xFEEDFACF:
+            raise ValueError(f"{path.name}: not a 64-bit little-endian Mach-O slice")
+        cpu, _sub, _ftype, ncmds = struct.unpack_from("<iiII", blob, 4)
+        pos = 32
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack_from("<II", blob, pos)
+            if cmd == 0x19:  # LC_SEGMENT_64
+                segment = blob[pos + 8:pos + 24].rstrip(b"\0").decode()
+                nsects = struct.unpack_from("<I", blob, pos + 64)[0]
+                for index in range(nsects if segment != "__LINKEDIT" else 0):
+                    base = pos + 72 + index * 80
+                    section = blob[base:base + 16].rstrip(b"\0").decode()
+                    size, offset = struct.unpack_from("<QI", blob, base + 40)
+                    if offset:  # zero-fill sections have no file bytes
+                        out[(cpu, segment, section)] = hashlib.sha256(blob[offset:offset + size]).hexdigest()
+            pos += cmdsize
+    return out
+
+
+def same_library(shipped: pathlib.Path, source: pathlib.Path) -> str:
+    """'' if the shipped library is the release's; otherwise why not."""
+    if sha256_of(shipped) == sha256_of(source):
+        return ""
+    if shipped.suffix == ".dylib":
+        shipped_segments, source_segments = macho_segments(shipped), macho_segments(source)
+        if shipped_segments and shipped_segments == source_segments:
+            log(f"{shipped.name}: every code/data section of every architecture matches the release "
+                f"({len(source_segments)} sections); only the code signature differs (Unity re-signs plugins)")
+            return ""
+        return (f"differs from the release's in its code or data "
+                f"(sections {sorted(set(shipped_segments) ^ set(source_segments)) or "with different bytes"})")
+    return "differs from the release's"
+
+
 def main() -> None:
     project = pathlib.Path(os.environ.get("DSL_PROJECT_DIR") or pathlib.Path.cwd())
     output = os.environ.get("DSL_OUTPUT_DIR")
@@ -78,9 +138,13 @@ def main() -> None:
     if not libs:
         problems.append(f"native library {lib_name} is not in the player")
     else:
+        source = project / "Packages/com.github.homuler.mediapipe/Runtime/Plugins" / lib_name
+        if not source.is_file() or sha256_of(source) != manifest["native_libs"][lib_name]:
+            sys.exit(f"{source} is not the file pre_build placed; cannot compare")
         for lib in libs:
-            if sha256_of(lib) != manifest["native_libs"][lib_name]:
-                problems.append(f"{lib.relative_to(output)} differs from the release's {lib_name}")
+            why = same_library(lib, source)
+            if why:
+                problems.append(f"{lib.relative_to(output)} {why}")
             else:
                 log(f"native library OK: {lib.relative_to(output)} ({lib.stat().st_size} bytes)")
 
